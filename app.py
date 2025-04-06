@@ -1,119 +1,141 @@
-import ccxt
+import streamlit as st
 import pandas as pd
 import numpy as np
-import ta
+import yfinance as yf
+import datetime
+from ta.trend import EMAIndicator, MACD
+from ta.momentum import RSIIndicator
 import matplotlib.pyplot as plt
-import streamlit as st
 
-# 1️⃣ Page Setup
-st.set_page_config(layout="wide")
-st.title("📈 Advanced Crypto Backtester – EMA + Fib + RSI + MACD + Candles")
+# --------------------------------------------
+# 🔧 Custom Functions
+# --------------------------------------------
 
-# 2️⃣ User Inputs
-col1, col2, col3 = st.columns(3)
-with col1:
-    selected_symbol = st.selectbox("Select Coin", ['SOL/USDT', 'BTC/USDT', 'ETH/USDT'])
-with col2:
-    timeframe = st.selectbox("Timeframe", ['1m', '5m', '15m'])
-with col3:
-    risk_reward = st.slider("Risk-Reward Ratio", 1.0, 5.0, 2.0, step=0.5)
-
-stop_loss_pct = 1.0
-target_pct = stop_loss_pct * risk_reward
-
-# 3️⃣ Fetch Live Data
-@st.cache_data
-def fetch_data(symbol, tf):
-    exchange = ccxt.binance()
-    ohlcv = exchange.fetch_ohlcv(symbol, tf, limit=500)
-    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+def download_data(symbol, interval, lookback_minutes=1440):
+    end = datetime.datetime.now()
+    start = end - datetime.timedelta(minutes=lookback_minutes)
+    df = yf.download(tickers=symbol, start=start, end=end, interval=interval)
+    df = df.reset_index()
+    df.dropna(inplace=True)
+    df.columns = [c.lower() for c in df.columns]
     return df
 
-df = fetch_data(selected_symbol, timeframe)
-df['ema9'] = ta.trend.ema_indicator(df['close'], window=9)
-df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
-macd = ta.trend.MACD(df['close'])
-df['macd'] = macd.macd()
-df['macd_signal'] = macd.macd_signal()
+def apply_indicators(df):
+    df['ema9'] = EMAIndicator(df['close'], window=9).ema_indicator()
+    df['rsi'] = RSIIndicator(df['close'], window=14).rsi()
+    macd = MACD(df['close'])
+    df['macd'] = macd.macd()
+    df['macd_signal'] = macd.macd_signal()
 
-# 4️⃣ Candlestick Pattern: Bullish Engulfing
-df['bullish_engulfing'] = (df['open'].shift(1) > df['close'].shift(1)) & (df['open'] < df['close']) & (df['open'] < df['close'].shift(1)) & (df['close'] > df['open'].shift(1))
+    # Bullish engulfing
+    df['bullish_engulfing'] = (df['close'].shift(1) < df['open'].shift(1)) & \
+                              (df['close'] > df['open']) & \
+                              (df['close'] > df['open'].shift(1)) & \
+                              (df['open'] < df['close'].shift(1))
 
-# 5️⃣ Fibonacci
-swing_low = df['low'][-100:].min()
-swing_high = df['high'][-100:].max()
-fib_38 = swing_high - (swing_high - swing_low) * 0.382
-fib_50 = swing_high - (swing_high - swing_low) * 0.5
-fib_61 = swing_high - (swing_high - swing_low) * 0.618
+    # Volume spike
+    df['vol_spike'] = df['volume'] > df['volume'].rolling(20).mean() * 1.5
 
-# 6️⃣ Entry Strategy
-entries = []
-position = False
-buy_price = 0
+    # Breakout (50-bar high)
+    df['recent_high'] = df['high'].rolling(50).max()
+    df['breakout'] = df['close'] > df['recent_high'].shift(1)
 
-for i in range(1, len(df)):
-    row = df.iloc[i]
-    
-    if not position:
-        condition = (
-            row['close'] > row['ema9'] and
-            row['low'] <= fib_61 and row['high'] >= fib_38 and
-            row['rsi'] > 50 and
-            row['macd'] > row['macd_signal'] and
-            row['bullish_engulfing']
-        )
-        if condition:
-            position = True
-            buy_price = row['close']
-            entries.append((row['timestamp'], row['close'], 'BUY'))
-            df.at[i, 'position'] = 1
+    return df
+
+def get_fibonacci_levels(price):
+    fib_38 = price * 0.382
+    fib_61 = price * 0.618
+    return fib_38, fib_61
+
+def backtest_strategy(df, target_pct=1.0, stop_loss_pct=0.5):
+    entries = []
+    position = False
+    buy_price = 0
+    df['position'] = 0
+
+    for i in range(51, len(df)):
+        row = df.iloc[i]
+        fib_38, fib_61 = get_fibonacci_levels(row['close'])
+
+        if not position:
+            condition = (
+                row['close'] > row['ema9'] and
+                row['low'] <= fib_61 and row['high'] >= fib_38 and
+                row['rsi'] > 50 and
+                row['macd'] > row['macd_signal'] and
+                row['bullish_engulfing'] and
+                row['vol_spike'] and
+                row['breakout']
+            )
+            if condition:
+                position = True
+                buy_price = row['close']
+                entries.append((row['datetime'], row['close'], 'BUY'))
+                df.at[i, 'position'] = 1
+            else:
+                df.at[i, 'position'] = 0
         else:
-            df.at[i, 'position'] = 0
-    else:
-        if row['close'] >= buy_price * (1 + target_pct / 100):
-            entries.append((row['timestamp'], row['close'], 'TARGET'))
-            position = False
-            df.at[i, 'position'] = 0
-        elif row['close'] <= buy_price * (1 - stop_loss_pct / 100):
-            entries.append((row['timestamp'], row['close'], 'STOP'))
-            position = False
-            df.at[i, 'position'] = 0
-        else:
-            df.at[i, 'position'] = 1
+            if row['close'] >= buy_price * (1 + target_pct / 100):
+                entries.append((row['datetime'], row['close'], 'TARGET'))
+                position = False
+                df.at[i, 'position'] = 0
+            elif row['close'] <= buy_price * (1 - stop_loss_pct / 100):
+                entries.append((row['datetime'], row['close'], 'STOP'))
+                position = False
+                df.at[i, 'position'] = 0
+            else:
+                df.at[i, 'position'] = 1
 
-df['position'] = df['position'].fillna(0)
-df['returns'] = df['close'].pct_change()
-df['strategy_returns'] = df['returns'] * df['position']
-cumulative = (1 + df['strategy_returns'].fillna(0)).cumprod()
+    return entries, df
 
-# 7️⃣ Chart
-st.subheader("📊 Strategy vs Buy & Hold")
+# --------------------------------------------
+# 🚀 Streamlit App
+# --------------------------------------------
 
-fig, ax = plt.subplots(figsize=(12, 5))
-ax.plot(df['timestamp'], cumulative, label='Strategy', color='green')
-ax.plot(df['timestamp'], (1 + df['returns'].fillna(0)).cumprod(), label='Buy & Hold', color='gray')
+st.set_page_config(page_title="Solana Intraday Strategy", layout="wide")
+st.title("🚀 Solana Intraday Strategy Backtest Dashboard")
 
-for t, price, tag in entries:
-    color = 'blue' if tag == 'BUY' else ('green' if tag == 'TARGET' else 'red')
-    ax.scatter(t, price, color=color, label=tag if tag not in [e[2] for e in entries[:entries.index((t, price, tag))]] else "", marker='o')
+# Sidebar inputs
+st.sidebar.header("📊 Backtest Settings")
+target_pct = st.sidebar.slider("🎯 Target %", 0.5, 5.0, 1.0)
+stop_loss_pct = st.sidebar.slider("🛑 Stop Loss %", 0.5, 5.0, 0.5)
+lookback_minutes = st.sidebar.slider("🔁 Lookback Minutes", 60, 1440, 720)
 
+# Get data
+st.subheader("📈 Market Data (SOL-USD)")
+df = download_data("SOL-USD", "1m", lookback_minutes)
+df = apply_indicators(df)
+
+# Run strategy
+entries, df = backtest_strategy(df, target_pct, stop_loss_pct)
+
+# Show latest indicators
+with st.expander("🔢 Fibonacci & Indicators"):
+    latest = df.iloc[-1]
+    fib_38, fib_61 = get_fibonacci_levels(latest['close'])
+    st.write(f"🔹 Current Price: {latest['close']:.2f}")
+    st.write(f"🔹 EMA9: {latest['ema9']:.2f}")
+    st.write(f"🔹 RSI: {latest['rsi']:.2f}")
+    st.write(f"🔹 MACD: {latest['macd']:.4f}, Signal: {latest['macd_signal']:.4f}")
+    st.write(f"🔹 Fib 38.2%: {fib_38:.2f}, Fib 61.8%: {fib_61:.2f}")
+    st.write(f"🔹 Volume Spike: {latest['vol_spike']}")
+    st.write(f"🔹 Breakout: {latest['breakout']}")
+    st.write(f"🔹 Bullish Engulfing: {latest['bullish_engulfing']}")
+
+# Trade log
+st.subheader("📋 Trade Log")
+if entries:
+    trade_log = pd.DataFrame(entries, columns=["Time", "Price", "Action"])
+    st.dataframe(trade_log)
+else:
+    st.warning("No trades found with current filters.")
+
+# Plot trades
+st.subheader("📊 Price Chart with Trades")
+fig, ax = plt.subplots(figsize=(14, 5))
+ax.plot(df['datetime'], df['close'], label='Price', color='gray')
+buy_signals = df[df['position'] == 1]
+ax.scatter(buy_signals['datetime'], buy_signals['close'], marker='^', color='green', label='Buy')
+ax.set_title("Solana - 1 Min Chart")
 ax.legend()
 st.pyplot(fig)
-
-# 8️⃣ Fibonacci & Indicators
-with st.expander("🔢 Fibonacci & Indicators"):
-    st.write(f"**Swing High**: {swing_high:.2f}, **Swing Low**: {swing_low:.2f}")
-    st.write(f"Fib 38.2%: {fib_38:.2f}, Fib 50%: {fib_50:.2f}, Fib 61.8%: {fib_61:.2f}")
-
-# 9️⃣ Trades Table
-st.subheader("📋 Trades Log")
-trades_df = pd.DataFrame(entries, columns=['Time', 'Price', 'Action'])
-st.dataframe(trades_df.tail(10), use_container_width=True)
-
-csv = trades_df.to_csv(index=False).encode('utf-8')
-st.download_button("📥 Download Trade Log", csv, "trades.csv", "text/csv")
-
-# 🔟 Summary
-st.subheader("📈 Performance Summary")
-st.metric("Strategy Return", f"{(cumulative.iloc[-1] - 1)*100:.2f}%")
